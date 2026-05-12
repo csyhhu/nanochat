@@ -10,6 +10,7 @@ import torch
 
 from nanochat.common import get_base_dir
 from nanochat.gpt import GPT, GPTConfig
+from nanochat.ds_v4 import DSV4, DSV4Config
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
 
@@ -27,8 +28,12 @@ def _patch_missing_config_keys(model_config_kwargs):
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
 
-def _patch_missing_keys(model_data, model_config):
+def _patch_missing_keys(model_data, model_config, arch):
     """Add default values for new parameters that may be missing in old checkpoints."""
+    # These compatibility tensors only exist in the GPT architecture.
+    if arch != "gpt":
+        return
+
     n_layer = model_config.n_layer
     # resid_lambdas defaults to 1.0 (identity scaling)
     if "resid_lambdas" not in model_data:
@@ -94,11 +99,19 @@ def build_model(checkpoint_dir, step, device, phase):
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
     _patch_missing_config_keys(model_config_kwargs)
-    log0(f"Building model with config: {model_config_kwargs}")
-    model_config = GPTConfig(**model_config_kwargs)
-    _patch_missing_keys(model_data, model_config)
+    arch = meta_data.get("arch", "gpt")
+    model_registry = {
+        "gpt": (GPT, GPTConfig),
+        "ds_v4": (DSV4, DSV4Config),
+    }
+    if arch not in model_registry:
+        raise ValueError(f"Unknown model arch '{arch}' in checkpoint metadata")
+    ModelClass, ConfigClass = model_registry[arch]
+    log0(f"Building model arch='{arch}' with config: {model_config_kwargs}")
+    model_config = ConfigClass(**model_config_kwargs)
+    _patch_missing_keys(model_data, model_config, arch)
     with torch.device("meta"):
-        model = GPT(model_config)
+        model = ModelClass(model_config)
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init

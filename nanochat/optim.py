@@ -12,13 +12,23 @@ import torch.distributed as dist
 from torch import Tensor
 from nanochat.common import COMPUTE_DTYPE
 
+# torch.compile inductor backend only works correctly on CUDA.
+# On MPS/CPU the inductor backend raises errors (e.g. "Device mps not supported").
+# We fall back to eager execution on non-CUDA devices.
+_CUDA_AVAILABLE = torch.cuda.is_available()
+def _maybe_compile(**kwargs):
+    """Apply torch.compile only on CUDA; return identity decorator otherwise."""
+    if _CUDA_AVAILABLE:
+        return torch.compile(**kwargs)
+    return lambda fn: fn  # identity: no-op on MPS/CPU
+
 # -----------------------------------------------------------------------------
 """
 Good old AdamW optimizer, fused kernel.
 https://arxiv.org/abs/1711.05101
 """
 
-@torch.compile(dynamic=False, fullgraph=True)
+@_maybe_compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(
     p: Tensor,              # (32768, 768) - parameter tensor
     grad: Tensor,           # (32768, 768) - gradient, same shape as p
@@ -35,7 +45,19 @@ def adamw_step_fused(
     Fused AdamW step: weight_decay -> momentum_update -> bias_correction -> param_update
     All in one compiled graph to eliminate Python overhead between ops.
     The 0-D CPU tensors avoid recompilation when hyperparameter values change.
+    On CUDA, torch.compile handles cross-device scalar promotion automatically.
+    On MPS/CPU (eager mode), we extract Python scalars via .item() to avoid
+    device mismatch errors.
     """
+    # Extract scalars when running in eager mode (MPS/CPU): .item() returns a Python float.
+    # Under torch.compile (CUDA) the tensors are used directly (compiler handles promotion).
+    if not torch.compiler.is_compiling():
+        step_t = step_t.item()
+        lr_t   = lr_t.item()
+        beta1_t = beta1_t.item()
+        beta2_t = beta2_t.item()
+        eps_t  = eps_t.item()
+        wd_t   = wd_t.item()
     # Weight decay (decoupled, applied before the update)
     p.mul_(1 - lr_t * wd_t)
     # Update running averages (lerp_ is cleaner and fuses well)
@@ -88,7 +110,7 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
+@_maybe_compile(dynamic=False, fullgraph=True)
 def muon_step_fused(
     stacked_grads: Tensor,          # (12, 768, 3072) - stacked gradients
     stacked_params: Tensor,         # (12, 768, 3072) - stacked parameters
@@ -105,10 +127,18 @@ def muon_step_fused(
     Fused Muon step: momentum -> polar_express -> variance_reduction -> cautious_update
     All in one compiled graph to eliminate Python overhead between ops.
     Some of the constants are 0-D CPU tensors to avoid recompilation when values change.
+    On MPS/CPU (eager mode), extract Python scalars to avoid device mismatch.
     """
+    # Extract scalars in eager mode (MPS/CPU) to avoid cross-device errors.
+    if not torch.compiler.is_compiling():
+        momentum_t = momentum_t.item()
+        lr_t       = lr_t.item()
+        wd_t       = wd_t.item()
+        beta2_t    = beta2_t.item()
 
     # Nesterov momentum
-    momentum = momentum_t.to(stacked_grads.dtype)
+    # momentum_t is a Python float in eager mode (already extracted above), or a 0-D tensor under compile.
+    momentum = float(momentum_t)  # works for both Python float and 0-D tensor
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
@@ -129,7 +159,7 @@ def muon_step_fused(
     g = X
 
     # Variance reduction
-    beta2 = beta2_t.to(g.dtype)
+    beta2 = float(beta2_t)  # works for both Python float and 0-D tensor
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
@@ -142,8 +172,9 @@ def muon_step_fused(
     g = g * final_scale.to(g.dtype)
 
     # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
+    # lr_t / wd_t are Python floats in eager mode, 0-D tensors under compile — both work directly.
+    lr = lr_t
+    wd = wd_t
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 

@@ -40,13 +40,14 @@ import random
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse, JSONResponse
 from pydantic import BaseModel
-from typing import List, Optional, AsyncGenerator
+from typing import List, Optional, AsyncGenerator, Any
 from dataclasses import dataclass
 from nanochat.common import compute_init, autodetect_device_type
-from nanochat.checkpoint_manager import load_model
-from nanochat.engine import Engine
+# NOTE: We intentionally do NOT import nanochat.checkpoint_manager / nanochat.engine at module
+# import time, because they pull in tokenizer dependencies (e.g. rustbpe). This file supports
+# multiple backends; for --backend=transformers we want a minimal dependency surface.
 
 # Abuse prevention limits
 MAX_MESSAGES_PER_REQUEST = 500
@@ -62,6 +63,12 @@ MAX_MAX_TOKENS = 4096
 parser = argparse.ArgumentParser(description='NanoChat Web Server')
 parser.add_argument('-n', '--num-gpus', type=int, default=1, help='Number of GPUs to use (default: 1)')
 parser.add_argument('-i', '--source', type=str, default="sft", help="Source of the model: sft|rl")
+parser.add_argument('--backend', type=str, default="nanochat", choices=["nanochat", "transformers"], help="Backend implementation")
+parser.add_argument('--hf-model-id', type=str, default="Qwen/Qwen2.5-0.5B-Instruct", help="HF model id for --backend=transformers")
+parser.add_argument('--hf-max-layers', type=int, default=0, help="If >0, keep only the first N transformer layers (transformers backend only)")
+parser.add_argument('--hf-max-context-len', type=int, default=4096, help="Max context length for transformers backend on Mac/MPS (helps avoid MPS >4GB tensor asserts)")
+parser.add_argument('--hf-attn-impl', type=str, default="", help="Transformers attention implementation override (e.g. eager, sdpa). Empty = default")
+parser.add_argument('--hf-use-cache', type=int, default=0, help="Transformers generate use_cache (0/1). On MPS, 0 can avoid large temporary allocations.")
 parser.add_argument('-t', '--temperature', type=float, default=0.8, help='Default temperature for generation')
 parser.add_argument('-k', '--top-k', type=int, default=50, help='Default top-k sampling parameter')
 parser.add_argument('-m', '--max-tokens', type=int, default=512, help='Default max tokens for generation')
@@ -88,8 +95,9 @@ class Worker:
     """A worker with a model loaded on a specific GPU."""
     gpu_id: int
     device: torch.device
-    engine: Engine
-    tokenizer: object
+    engine: Any | None
+    tokenizer: object | None
+    backend: object  # Engine (nanochat) or TransformersChatBackend (transformers)
 
 class WorkerPool:
     """Pool of workers, each with a model replica on a different GPU."""
@@ -119,13 +127,37 @@ class WorkerPool:
                 device = torch.device(device_type) # e.g. cpu|mps
                 print(f"Loading model on {device_type}...")
 
-            model, tokenizer, _ = load_model(source, device, phase="eval", model_tag=model_tag, step=step)
-            engine = Engine(model, tokenizer)
+            engine: Any | None = None
+            tokenizer = None
+
+            if args.backend == "nanochat":
+                # Lazy import to avoid pulling tokenizer deps for transformers-only envs.
+                from nanochat.checkpoint_manager import load_model
+                from nanochat.engine import Engine
+                model, tokenizer, _ = load_model(source, device, phase="eval", model_tag=model_tag, step=step)
+                engine = Engine(model, tokenizer)
+                backend = engine
+            else:
+                from nanochat.transformers_backend import TransformersChatBackend
+                torch_dtype = torch.float16 if device_type == "mps" else None
+                max_layers = args.hf_max_layers if args.hf_max_layers and args.hf_max_layers > 0 else None
+                attn_impl = args.hf_attn_impl if args.hf_attn_impl else None
+                use_cache = bool(int(args.hf_use_cache))
+                backend = TransformersChatBackend(
+                    args.hf_model_id,
+                    device=device,
+                    torch_dtype=torch_dtype,
+                    max_layers=max_layers,
+                    max_context_len=int(args.hf_max_context_len) if args.hf_max_context_len and args.hf_max_context_len > 0 else None,
+                    attn_implementation=attn_impl,
+                    use_cache=use_cache,
+                )
             worker = Worker(
                 gpu_id=gpu_id,
                 device=device,
                 engine=engine,
                 tokenizer=tokenizer,
+                backend=backend,
             )
             self.workers.append(worker)
             await self.available_workers.put(worker)
@@ -183,7 +215,7 @@ def validate_chat_request(request: ChatRequest):
 
     # Validate role values
     for i, message in enumerate(request.messages):
-        if message.role not in ["user", "assistant"]:
+        if message.role not in ["system", "user", "assistant"]:
             raise HTTPException(
                 status_code=400,
                 detail=f"Message {i} has invalid role. Must be 'user', 'assistant', or 'system'"
@@ -216,7 +248,7 @@ def validate_chat_request(request: ChatRequest):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load models on all GPUs on startup."""
-    print("Loading nanochat models across GPUs...")
+    print(f"Loading models across workers... backend={args.backend}")
     app.state.worker_pool = WorkerPool(num_gpus=args.num_gpus)
     await app.state.worker_pool.initialize(args.source, model_tag=args.model_tag, step=args.step)
     print(f"Server ready at http://localhost:{args.port}")
@@ -264,6 +296,7 @@ async def generate_stream(
     max_new_tokens = max_new_tokens if max_new_tokens is not None else args.max_tokens
     top_k = top_k if top_k is not None else args.top_k
 
+    assert worker.engine is not None and worker.tokenizer is not None, "generate_stream requires nanochat backend"
     assistant_end = worker.tokenizer.encode_special("<|assistant_end|>")
     bos = worker.tokenizer.get_bos_token_id()
 
@@ -302,6 +335,66 @@ async def generate_stream(
 
     yield f"data: {json.dumps({'done': True})}\n\n"
 
+
+async def generate_full_text_transformers(worker: Worker, request: ChatRequest) -> str:
+    from nanochat.transformers_backend import TransformersGenerateParams
+
+    temperature = request.temperature if request.temperature is not None else args.temperature
+    max_new_tokens = request.max_tokens if request.max_tokens is not None else args.max_tokens
+    top_k = request.top_k if request.top_k is not None else args.top_k
+
+    messages = [{"role": m.role, "content": m.content} for m in request.messages]
+    params = TransformersGenerateParams(
+        temperature=float(temperature),
+        top_k=int(top_k),
+        max_new_tokens=int(max_new_tokens),
+    )
+    return worker.backend.generate_text(messages, params)
+
+
+async def generate_stream_transformers(worker: Worker, request: ChatRequest) -> AsyncGenerator[str, None]:
+    """
+    Async wrapper around the blocking HF streamer.
+
+    Runs the blocking generator in a background thread and forwards chunks as SSE.
+    """
+    import threading
+
+    from nanochat.transformers_backend import TransformersGenerateParams
+
+    temperature = request.temperature if request.temperature is not None else args.temperature
+    max_new_tokens = request.max_tokens if request.max_tokens is not None else args.max_tokens
+    top_k = request.top_k if request.top_k is not None else args.top_k
+
+    messages = [{"role": m.role, "content": m.content} for m in request.messages]
+    params = TransformersGenerateParams(
+        temperature=float(temperature),
+        top_k=int(top_k),
+        max_new_tokens=int(max_new_tokens),
+    )
+
+    loop = asyncio.get_running_loop()
+    q: asyncio.Queue[Optional[str]] = asyncio.Queue()
+
+    def _worker_thread():
+        try:
+            for text in worker.backend.generate_text_iter(messages, params):
+                loop.call_soon_threadsafe(q.put_nowait, text)
+        except Exception as e:
+            loop.call_soon_threadsafe(q.put_nowait, f"[ERROR] {e}")
+        finally:
+            loop.call_soon_threadsafe(q.put_nowait, None)
+
+    threading.Thread(target=_worker_thread, daemon=True).start()
+
+    while True:
+        item = await q.get()
+        if item is None:
+            break
+        yield f"data: {json.dumps({'token': item, 'gpu': worker.gpu_id}, ensure_ascii=False)}\n\n"
+
+    yield f"data: {json.dumps({'done': True})}\n\n"
+
 @app.post("/chat/completions")
 async def chat_completions(request: ChatRequest):
     """Chat completion endpoint (streaming only) - uses worker pool for multi-GPU."""
@@ -320,58 +413,117 @@ async def chat_completions(request: ChatRequest):
     worker = await worker_pool.acquire_worker()
 
     try:
-        # Build conversation tokens
-        bos = worker.tokenizer.get_bos_token_id()
-        user_start = worker.tokenizer.encode_special("<|user_start|>")
-        user_end = worker.tokenizer.encode_special("<|user_end|>")
-        assistant_start = worker.tokenizer.encode_special("<|assistant_start|>")
-        assistant_end = worker.tokenizer.encode_special("<|assistant_end|>")
-
-        conversation_tokens = [bos]
-        for message in request.messages:
-            if message.role == "user":
-                conversation_tokens.append(user_start)
-                conversation_tokens.extend(worker.tokenizer.encode(message.content))
-                conversation_tokens.append(user_end)
-            elif message.role == "assistant":
-                conversation_tokens.append(assistant_start)
-                conversation_tokens.extend(worker.tokenizer.encode(message.content))
-                conversation_tokens.append(assistant_end)
-
-        conversation_tokens.append(assistant_start)
-
-        # Streaming response with worker release after completion
         response_tokens = []
+
         async def stream_and_release():
             try:
-                async for chunk in generate_stream(
-                    worker,
-                    conversation_tokens,
-                    temperature=request.temperature,
-                    max_new_tokens=request.max_tokens,
-                    top_k=request.top_k
-                ):
-                    # Accumulate response for logging
-                    chunk_data = json.loads(chunk.replace("data: ", "").strip())
-                    if "token" in chunk_data:
-                        response_tokens.append(chunk_data["token"])
-                    yield chunk
+                if args.backend == "nanochat":
+                    assert worker.tokenizer is not None
+                    # Build conversation tokens (nanochat special tokens)
+                    bos = worker.tokenizer.get_bos_token_id()
+                    user_start = worker.tokenizer.encode_special("<|user_start|>")
+                    user_end = worker.tokenizer.encode_special("<|user_end|>")
+                    assistant_start = worker.tokenizer.encode_special("<|assistant_start|>")
+                    assistant_end = worker.tokenizer.encode_special("<|assistant_end|>")
+
+                    conversation_tokens = [bos]
+                    for message in request.messages:
+                        if message.role == "user":
+                            conversation_tokens.append(user_start)
+                            conversation_tokens.extend(worker.tokenizer.encode(message.content))
+                            conversation_tokens.append(user_end)
+                        elif message.role == "assistant":
+                            conversation_tokens.append(assistant_start)
+                            conversation_tokens.extend(worker.tokenizer.encode(message.content))
+                            conversation_tokens.append(assistant_end)
+                        elif message.role == "system":
+                            # nanochat tokenizer/rendering may not support system tokens here; treat as user prefix.
+                            conversation_tokens.append(user_start)
+                            conversation_tokens.extend(worker.tokenizer.encode(message.content))
+                            conversation_tokens.append(user_end)
+
+                    conversation_tokens.append(assistant_start)
+
+                    async for chunk in generate_stream(
+                        worker,
+                        conversation_tokens,
+                        temperature=request.temperature,
+                        max_new_tokens=request.max_tokens,
+                        top_k=request.top_k,
+                    ):
+                        chunk_data = json.loads(chunk.replace("data: ", "").strip())
+                        if "token" in chunk_data:
+                            response_tokens.append(chunk_data["token"])
+                        yield chunk
+                else:
+                    async for chunk in generate_stream_transformers(worker, request):
+                        chunk_data = json.loads(chunk.replace("data: ", "").strip())
+                        if "token" in chunk_data:
+                            response_tokens.append(chunk_data["token"])
+                        yield chunk
             finally:
-                # Log the assistant response to console
                 full_response = "".join(response_tokens)
                 logger.info(f"[ASSISTANT] (GPU {worker.gpu_id}): {full_response}")
                 logger.info("="*20)
-                # Release worker back to pool after streaming is done
                 await worker_pool.release_worker(worker)
 
-        return StreamingResponse(
-            stream_and_release(),
-            media_type="text/event-stream"
-        )
+        return StreamingResponse(stream_and_release(), media_type="text/event-stream")
     except Exception as e:
         # Make sure to release worker even on error
         await worker_pool.release_worker(worker)
         raise e
+
+
+@app.post("/chat/completions_sync")
+async def chat_completions_sync(request: ChatRequest):
+    """Simplified non-streaming endpoint for debugging/testing."""
+    validate_chat_request(request)
+    worker_pool = app.state.worker_pool
+    worker = await worker_pool.acquire_worker()
+    try:
+        if args.backend == "nanochat":
+            assert worker.tokenizer is not None
+            # Reuse the tokenization used by the streaming endpoint.
+            bos = worker.tokenizer.get_bos_token_id()
+            user_start = worker.tokenizer.encode_special("<|user_start|>")
+            user_end = worker.tokenizer.encode_special("<|user_end|>")
+            assistant_start = worker.tokenizer.encode_special("<|assistant_start|>")
+            assistant_end = worker.tokenizer.encode_special("<|assistant_end|>")
+
+            conversation_tokens = [bos]
+            for message in request.messages:
+                if message.role == "user":
+                    conversation_tokens.append(user_start)
+                    conversation_tokens.extend(worker.tokenizer.encode(message.content))
+                    conversation_tokens.append(user_end)
+                elif message.role == "assistant":
+                    conversation_tokens.append(assistant_start)
+                    conversation_tokens.extend(worker.tokenizer.encode(message.content))
+                    conversation_tokens.append(assistant_end)
+                elif message.role == "system":
+                    conversation_tokens.append(user_start)
+                    conversation_tokens.extend(worker.tokenizer.encode(message.content))
+                    conversation_tokens.append(user_end)
+            conversation_tokens.append(assistant_start)
+
+            chunks: list[str] = []
+            async for chunk in generate_stream(
+                worker,
+                conversation_tokens,
+                temperature=request.temperature,
+                max_new_tokens=request.max_tokens,
+                top_k=request.top_k,
+            ):
+                chunk_data = json.loads(chunk.replace("data: ", "").strip())
+                if "token" in chunk_data:
+                    chunks.append(chunk_data["token"])
+            text = "".join(chunks)
+        else:
+            text = await generate_full_text_transformers(worker, request)
+
+        return JSONResponse({"text": text})
+    finally:
+        await worker_pool.release_worker(worker)
 
 @app.get("/health")
 async def health():
