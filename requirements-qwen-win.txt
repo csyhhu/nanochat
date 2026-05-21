@@ -1,0 +1,13 @@
+# Isolated env for --backend=transformers (Windows / CPU).
+# Install torch CPU separately:
+#   pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cpu
+numpy>=1.26.0
+# Pin 4.x to avoid pulling hub>=1.5 via transformers 5.x (optional; 5.x also works on Windows)
+transformers>=4.57.3,<5.0
+fastapi>=0.117.1
+uvicorn>=0.36.0
+psutil>=7.1.0
+filelock
+requests
+# Optional: continue PT
+datasets>=4.0.0

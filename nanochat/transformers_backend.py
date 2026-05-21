@@ -1,9 +1,98 @@
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+
+def _is_hf_hub_repo_id(raw: str) -> bool:
+    """True for Hub ids like Qwen/Qwen2.5-0.5B (not filesystem paths)."""
+    if "\\" in raw:
+        return False
+    if os.name == "nt" and len(raw) >= 2 and raw[1] == ":":
+        return False
+    if raw.startswith(("/", ".", "~")):
+        return False
+    parts = raw.split("/")
+    return len(parts) == 2 and all(parts) and all(p.strip() for p in parts)
+
+
+def resolve_hf_model_path(model_id: str) -> str:
+    """
+    Hub repo id (e.g. Qwen/Qwen2.5-0.5B) or a local directory for from_pretrained.
+
+    On Windows, existing directories are resolved to absolute paths so
+    huggingface_hub does not treat D:\\... as an invalid repo id (HFValidationError).
+    """
+    raw = model_id.strip()
+    if _is_hf_hub_repo_id(raw):
+        return raw
+
+    candidates = [Path(raw).expanduser()]
+    if os.name == "nt" and "\\" in raw:
+        candidates.append(Path(raw.replace("\\", "/")).expanduser())
+
+    for p in candidates:
+        try:
+            resolved = p.resolve()
+        except OSError:
+            continue
+        if resolved.is_dir() or resolved.is_file():
+            return str(resolved)
+
+    raise FileNotFoundError(
+        f"Local model path not found: {model_id!r}\n"
+        "Ensure the directory exists and contains config.json "
+        "(e.g. huggingface-cli download ... --local-dir D:/hf_models/Qwen2.5-0.5B).\n"
+        "For Hub models use the repo id, e.g. Qwen/Qwen2.5-0.5B (cached under "
+        f"{Path.home() / '.cache' / 'huggingface' / 'hub'})."
+    )
+
+
+def resolve_hub_cached_snapshot(repo_id: str) -> Optional[str]:
+    """Return snapshot directory if repo_id is already in the local HF hub cache."""
+    try:
+        from huggingface_hub import try_to_load_from_cache  # type: ignore
+    except ImportError:
+        return None
+    config_path = try_to_load_from_cache(repo_id, "config.json")
+    if config_path is None:
+        return None
+    return str(Path(config_path).parent.resolve())
+
+
+def _prefer_offline_hub_load(model_id: str, load_path: str) -> tuple[str, bool]:
+    """
+    If weights are cached locally, load from snapshot with local_files_only=True
+    so huggingface.co is not contacted (avoids timeouts without HF_ENDPOINT).
+    """
+    raw = model_id.strip()
+    if not _is_hf_hub_repo_id(raw):
+        return load_path, False
+
+    if os.environ.get("HF_ENDPOINT", "").strip():
+        return load_path, False
+
+    cached = resolve_hub_cached_snapshot(raw)
+    if cached:
+        logger.info("Using local Hugging Face cache (offline): %s", cached)
+        return cached, True
+
+    logger.warning(
+        "HF_ENDPOINT is not set; huggingface_hub may contact huggingface.co and time out. "
+        "In PowerShell run: $env:HF_ENDPOINT = 'https://hf-mirror.com' "
+        "Or pass a snapshot path as --hf-model-id (see tutorial/windows_qwen_setup.md)."
+    )
+    force = os.environ.get("NANOCHAT_HF_LOCAL_FILES_ONLY", "").strip().lower()
+    if force in ("1", "true", "yes"):
+        return load_path, True
+    return load_path, False
 
 
 @dataclass
@@ -44,19 +133,22 @@ class TransformersChatBackend:
                 f"Original error:\n{e}"
             ) from e
 
-        self.model_id = model_id
+        load_path = resolve_hf_model_path(model_id)
+        load_path, local_files_only = _prefer_offline_hub_load(model_id, load_path)
+        self.model_id = load_path
         self.device = device
 
+        pretrained_kw = dict(trust_remote_code=False, local_files_only=local_files_only)
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_id,
-            trust_remote_code=False,
+            load_path,
             use_fast=True,
+            **pretrained_kw,
         )
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            trust_remote_code=False,
+            load_path,
             torch_dtype=torch_dtype,
             low_cpu_mem_usage=True,
+            **pretrained_kw,
         )
         self.use_cache = bool(use_cache)
         if attn_implementation is not None:
