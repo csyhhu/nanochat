@@ -3,28 +3,30 @@
 Continue pretraining (causal LM loss) on a Hugging Face causal LM, with optional
 first-N-layer truncation — same idea as `scripts/chat_web.py --hf-max-layers`.
 
+**Default: LoRA (PEFT)** on frozen base weights — a light pass over PT data, not full
+finetuning. Use ``--full-finetune`` to train all parameters (old behaviour).
+
 Supports periodic eval on a separate split (e.g. wikitext validation). Metrics are
 written to ``trainer_state.json`` under ``--output-dir`` (train ``loss``, ``eval_loss``).
+LoRA runs save the adapter under ``--output-dir`` (load base ``--model-id`` + adapter at inference).
 
-Dependencies: ``torch``, ``transformers``, ``datasets``.
+Dependencies: ``torch``, ``transformers``, ``datasets``, ``accelerate``, ``peft``.
 
 Examples::
 
     export PYTHONPATH="$(pwd)"
-    # WikiText PT + validation eval every 50 steps
+    # LoRA continue PT (default) on WikiText subset
     python -m scripts.qwen_continue_pt \\
       --model-id Qwen/Qwen2.5-0.5B \\
       --max-layers 6 \\
       --preset wikitext \\
       --max-samples 5000 \\
-      --block-size 512 \\
+      --block-size 256 \\
       --max-steps 500 \\
-      --eval-steps 50 \\
-      --logging-steps 10 \\
-      --output-dir ./out/qwen6-pt-wiki
+      --output-dir ./out/qwen6-lora-wiki
 
-    # Disable eval
-    python -m scripts.qwen_continue_pt ... --no-eval
+    # Full finetune (all trainable weights)
+    python -m scripts.qwen_continue_pt ... --full-finetune --output-dir ./out/qwen6-pt-wiki
 """
 
 from __future__ import annotations
@@ -102,6 +104,25 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--save-steps", type=int, default=500)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--gradient-checkpointing", action="store_true", help="Trade compute for memory.")
+    p.add_argument(
+        "--full-finetune",
+        action="store_true",
+        help="Train all weights (disable LoRA). Default is LoRA-only training.",
+    )
+    p.add_argument("--lora-rank", type=int, default=16, help="LoRA rank (default: 16).")
+    p.add_argument("--lora-alpha", type=int, default=32, help="LoRA alpha (default: 32).")
+    p.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA dropout.")
+    p.add_argument(
+        "--lora-target-modules",
+        type=str,
+        default=None,
+        help="Comma-separated module names (default: Qwen attention+MLP projections).",
+    )
+    p.add_argument(
+        "--benchmark-no-save",
+        action="store_true",
+        help="Skip writing model/tokenizer checkpoints (for grid benchmark runs; saves disk).",
+    )
     p.add_argument("--output-dir", type=str, required=True)
     return p.parse_args()
 
@@ -190,6 +211,47 @@ def _prepare_packed_dataset(
     return grouped
 
 
+def _default_lora_targets() -> List[str]:
+    return ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+
+def _apply_lora(model: Any, args: argparse.Namespace) -> Any:
+    try:
+        from peft import LoraConfig, TaskType, get_peft_model  # type: ignore
+    except ImportError as e:
+        print(
+            "LoRA requires peft. Install with:\n"
+            "  pip install peft\n",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from e
+
+    if args.lora_target_modules:
+        targets = [m.strip() for m in args.lora_target_modules.split(",") if m.strip()]
+    else:
+        targets = _default_lora_targets()
+
+    config = LoraConfig(
+        r=int(args.lora_rank),
+        lora_alpha=int(args.lora_alpha),
+        lora_dropout=float(args.lora_dropout),
+        target_modules=targets,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+    model = get_peft_model(model, config)
+    if args.gradient_checkpointing:
+        model.enable_input_require_grads()
+    model.print_trainable_parameters()
+    return model
+
+
+def _trainable_param_count(model: Any) -> tuple[int, int]:
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    return trainable, total
+
+
 def _write_run_summary(output_dir: str, summary: Dict[str, Any]) -> None:
     path = Path(output_dir) / "pt_run_summary.json"
     path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -222,7 +284,7 @@ def main() -> None:
         print(
             "Missing dependency. Install with e.g.\n"
             "  uv sync --group dev\n"
-            "or: pip install transformers datasets\n\n"
+            "or: pip install transformers datasets accelerate peft\n\n"
             f"Original error: {e}",
             file=sys.stderr,
         )
@@ -258,6 +320,21 @@ def main() -> None:
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
+
+    use_lora = not args.full_finetune
+    lora_targets: Optional[List[str]] = None
+    if use_lora:
+        lora_targets = (
+            [m.strip() for m in args.lora_target_modules.split(",") if m.strip()]
+            if args.lora_target_modules
+            else _default_lora_targets()
+        )
+        model = _apply_lora(model, args)
+    else:
+        print("Full finetune: all parameters trainable.", flush=True)
+
+    trainable, total = _trainable_param_count(model)
+    print(f"Trainable params: {trainable:,} / {total:,} ({100.0 * trainable / max(total, 1):.2f}%)", flush=True)
 
     train_grouped = _prepare_packed_dataset(
         load_dataset=load_dataset,
@@ -307,6 +384,7 @@ def main() -> None:
         logging_steps=int(args.logging_steps),
         save_steps=int(args.save_steps),
         save_total_limit=2,
+        save_strategy="no" if args.benchmark_no_save else "steps",
         prediction_loss_only=True,
         report_to="none",
         seed=args.seed,
@@ -328,7 +406,8 @@ def main() -> None:
 
     print(
         f"Train packed blocks: {len(train_grouped)} | split={args.split!r} | "
-        f"device={device_type} | max_steps={args.max_steps}"
+        f"device={device_type} | max_steps={args.max_steps} | "
+        f"peft={'lora' if use_lora else 'none'}"
     )
     if use_eval:
         print(
@@ -344,10 +423,12 @@ def main() -> None:
         print(f"Initial eval_loss: {initial_eval_loss:.6f}")
 
     train_result = trainer.train()
-    trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
+    if not args.benchmark_no_save:
+        trainer.save_model(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
 
     final_train_loss = train_result.training_loss
+    train_metrics: Dict[str, Any] = dict(getattr(train_result, "metrics", None) or {})
     final_eval_loss: Optional[float] = None
     if use_eval:
         print("Running final eval …")
@@ -358,6 +439,12 @@ def main() -> None:
     state_path = Path(args.output_dir) / "trainer_state.json"
     summary = {
         "model_id": args.model_id,
+        "peft": "lora" if use_lora else "none",
+        "lora_rank": int(args.lora_rank) if use_lora else None,
+        "lora_alpha": int(args.lora_alpha) if use_lora else None,
+        "lora_target_modules": lora_targets,
+        "trainable_params": trainable,
+        "total_params": total,
         "max_layers": args.max_layers,
         "dataset": args.dataset,
         "dataset_config": args.dataset_config,
@@ -371,11 +458,24 @@ def main() -> None:
         "initial_eval_loss": initial_eval_loss,
         "final_train_loss": final_train_loss,
         "final_eval_loss": final_eval_loss,
-        "trainer_state_json": str(state_path),
+        "train_runtime_sec": train_metrics.get("train_runtime"),
+        "train_samples_per_second": train_metrics.get("train_samples_per_second"),
+        "train_steps_per_second": train_metrics.get("train_steps_per_second"),
+        "train_tokens_per_second": (
+            float(train_metrics["train_samples_per_second"]) * block_size
+            if train_metrics.get("train_samples_per_second") is not None
+            else None
+        ),
+        "trainer_state_json": str(state_path) if state_path.exists() else None,
     }
     _write_run_summary(args.output_dir, summary)
 
-    print(f"Saved model + tokenizer to {args.output_dir}")
+    if args.benchmark_no_save:
+        print(f"Benchmark run: skipped model/tokenizer save ({args.output_dir})")
+    elif use_lora:
+        print(f"Saved LoRA adapter + tokenizer to {args.output_dir}")
+    else:
+        print(f"Saved full model + tokenizer to {args.output_dir}")
     if state_path.exists():
         print(f"Train/eval loss history: {state_path} (log_history: loss, eval_loss)")
 
