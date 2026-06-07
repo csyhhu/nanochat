@@ -433,6 +433,69 @@ python -m scripts.qwen_continue_pt `
 
 **加速 eval：** 全量 validation 在 CPU 上可能 **单次 10–20 分钟**；务必加 `--eval-max-samples 500`、`--per-device-eval-batch-size 4`，并适当加大 `--eval-steps`（见上例）。
 
+**独立 eval（只跑 eval，不训练）：** 用 `--eval-only` 开关，跳过 train 数据准备和 optimizer 创建，只加载模型 + eval 集跑一次 eval 并打印 wall-clock 时间。
+
+```powershell
+
+# 全量 validation eval
+python -m scripts.qwen_continue_pt `
+  --model-id Qwen/Qwen2.5-0.5B `
+  --max-layers 6 `
+  --preset wikitext `
+  --eval-split validation `
+  --block-size 256 `
+  --per-device-eval-batch-size 4 `
+  --device-type cpu `
+  --eval-only
+```
+
+输出示例：
+```text
+Eval-only mode: 1125 blocks (288,000 tokens) | batch=4 | device=cpu | layers=6
+Running eval (this may take a while on CPU) …
+============================================================
+  Eval loss          : 9.234567
+  Perplexity         : 10246.78
+  Wall-clock         : 425.3s (7.1 min)
+  Samples/second     : 2.645
+  Tokens/second      : 677.1
+============================================================
+```
+
+**保存结果到 JSON 文件：**
+
+```powershell
+python -m scripts.qwen_continue_pt `
+  --model-id Qwen/Qwen2.5-0.5B --max-layers 6 `
+  --preset wikitext --eval-split validation `
+  --eval-max-samples 500 --block-size 256 `
+  --per-device-eval-batch-size 4 --device-type cpu `
+  --eval-only `
+  --eval-max-samples 200`
+  --output-json ./eval_results/test_200.json
+```
+
+JSON 输出示例：
+```json
+{
+  "model_id": "Qwen/Qwen2.5-0.5B",
+  "max_layers": 6,
+  "dataset": "Salesforce/wikitext",
+  "dataset_config": "wikitext-103-raw-v1",
+  "eval_split": "validation",
+  "block_size": 256,
+  "per_device_eval_batch_size": 4,
+  "device_type": "cpu",
+  "eval_blocks": 1125,
+  "eval_tokens": 288000,
+  "eval_loss": 9.234567,
+  "perplexity": 10246.78,
+  "wall_clock_sec": 425.3,
+  "samples_per_second": 2.645,
+  "tokens_per_second": 677.1
+}
+```
+
 ### 8.1 观测 CPU / 内存（外部工具，不改训练代码）
 
 在**另一个终端或图形界面**观察；`qwen_continue_pt` 不内置资源日志。
@@ -551,6 +614,112 @@ python -m scripts.analyze_pt_benchmark --benchmark-dir benchmarks/pt-grid-full
 
 自定义网格：`--grid-json path/to/grid.json`，例如  
 `{"per_device_train_batch_size":[1,2,4],"gradient_accumulation_steps":[4,8],"block_size":[256,512],"omp_num_threads":[null,8],"gradient_checkpointing":[false]}`。
+
+### 8.4 `--eval-max-samples` 选择：方差分析
+
+**问题：** `--eval-max-samples` 设多少才够？设太小 loss 波动大不可信，设太大浪费时间。
+
+**方法：** 固定 `--eval-seed` 跑多轮，对每个 `max_samples` 计算 **多次 eval loss 的 std**。若 std 足够小，则以此 `max_samples` 跑出的 loss 差值（如对比两个 checkpoint 或不同配置）在统计上是置信的。
+
+**环境：** `Qwen/Qwen2.5-0.5B`，截断 6 层，`block_size=256`，`device=cpu`，数据集 `wikitext-103-raw-v1` validation split。
+
+#### 运行 sweep（自动批量）
+
+```powershell
+cd D:\WorkSpace\nanochat
+$env:PYTHONPATH = (Get-Location).Path
+conda activate nanochat-qwen
+
+python scripts/eval_samples_sweep.py `
+  --samples 10,20,30,50,75 `
+  --num-trials 5 `
+  --base-seed 100 `
+  --block-size 256 `
+  --max-layers 6
+```
+
+每轮输出 JSON 到 `eval_results/sweep_n<max_samples>_s<seed>.json`。
+
+#### 汇总结果
+
+```powershell
+python scripts/summary_for_user.py
+```
+
+#### 结果
+
+| `--eval-max-samples` | n_trials | avg_eval_loss | std | avg_wall(s) |
+|---|---|---|---|---|
+| 10 | 10 | 15.5805 | 0.4822 | 12.3 |
+| 20 | 10 | 15.5255 | 0.4841 | 23.1 |
+| 30 | 10 | 15.4352 | 0.3291 | 38.6 |
+| 50 | 10 | 15.4481 | 0.2322 | 73.2 |
+| 75 | 10 | 15.4691 | 0.1496 | 116.2 |
+| 100 | 7 | 15.4187 | 0.0925 | 333.2 |
+| 150 | 3 | 15.4623 | 0.0629 | 279.5 |
+| 750 | 1 | 15.5279 | — | 785.1 |
+| 1000 | 1 | 15.5555 | — | 1143.0 |
+
+> **注：** n=100 有 7 trial，n=150 有 3 trial（部分未完成）；n=750、1000 仅 1 trial 无 std。`avg_wall(s)` 为各 trial 的平均墙钟时间。
+
+#### 解读与建议
+
+- **std 即该 `max_samples` 下 eval loss 的噪声水平。** 若某方法让 eval loss 下降幅度 **> std**，则结果是置信的。
+- **`--eval-max-samples 50`（std≈0.23，约 73 秒）推荐日常使用**：灵敏度足够（loss 下降 0.23 即可判定显著），耗时可接受。
+- **`--eval-max-samples 75`（std≈0.15，约 116 秒）**：更稳定，适合最终对比。
+- `max_samples=10~20`（std≈0.48，约 12~23 秒）：噪声太大，不推荐。
+- `max_samples=30`（std≈0.33，约 39 秒）：勉强可用，快速冒烟可接受。
+- `max_samples≥100`：std 很小但耗时陡增（n=100 反而 333s 是因为 block_size 变大导致 block 数暴增），性价比低。
+
+**结论：** 日常开发 / 消融实验用 `--eval-max-samples 50`；最终报告 / 精密对比用 `--eval-max-samples 75`。
+
+### 8.5 全量微调 + 定期 Eval（`--full-finetune`）
+
+默认 `qwen_continue_pt` 使用 LoRA（只训练 ~2.2M 参数）。加上 `--full-finetune` 后训练全部 ~228M 参数，模型质量更高，但吞吐略慢（见 8.0 节 benchmark：LoRA ≈ 0.84× 全量吞吐）。
+
+以下命令使用 `--eval-max-samples 100`（std≈0.09），每 50 步 eval 一次，eval loss 变化 ≥0.1 即为置信。
+
+```powershell
+cd D:\WorkSpace\nanochat
+$env:PYTHONPATH = (Get-Location).Path
+conda activate nanochat-qwen
+
+python -m scripts.qwen_continue_pt `
+  --model-id Qwen/Qwen2.5-0.5B `
+  --max-layers 6 `
+  --preset wikitext `
+  --eval-max-samples 100 `
+  --eval-steps 50 `
+  --block-size 256 `
+  --max-steps 500 `
+  --learning-rate 2e-5 `
+  --warmup-steps 50 `
+  --per-device-train-batch-size 4 `
+  --per-device-eval-batch-size 4 `
+  --gradient-accumulation-steps 8 `
+  --device-type cpu `
+  --full-finetune `
+  --output-dir D:/WorkSpace/nanochat/checkpoints/qwen6-ft-wiki `
+  > qwen6-ft-wiki.log 2>&1
+```
+
+**参数说明：**
+
+| 参数 | 值 | 说明 |
+|---|---|---|
+| `--full-finetune` | ✓ | 训练全部参数（去掉即回退到 LoRA） |
+| `--max-samples` | 5000 | 训练样本数 |
+| `--eval-max-samples` | 100 | 每轮 eval 用 100 条（std≈0.09） |
+| `--eval-steps` | 50 | 每 50 个 optimizer step 跑一次 eval |
+| `--max-steps` | 500 | 总共 500 步，即 10 次 eval |
+| `--per-device-train-batch-size` | 4 | 比默认 1 大，充分利用内存 |
+| `--gradient-accumulation-steps` | 8 | 等效 batch=4×8=32 |
+
+**输出：** `checkpoints/qwen6-ft-wiki/` 下：
+- `trainer_state.json` — 每步的 `loss` 和每 50 步的 `eval_loss`
+- `pt_run_summary.json` — 训练摘要（`peft: none`）
+
+**想改回 LoRA：** 去掉 `--full-finetune` 并改 `--output-dir` 即可。
 
 ---
 

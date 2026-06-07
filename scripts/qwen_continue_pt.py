@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -78,6 +79,8 @@ def _parse_args() -> argparse.Namespace:
         help="Cap train rows after load (ignored if split already sliced with [:N]).",
     )
 
+    p.add_argument("--eval-only", action="store_true", help="Run eval once and exit (skip training, no optimizer).")
+    p.add_argument("--output-json", type=str, default=None, help="If set, write eval-only results as JSON to this path.")
     p.add_argument("--no-eval", action="store_true", help="Disable evaluation during training.")
     p.add_argument(
         "--eval-split",
@@ -90,6 +93,13 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Cap eval rows after load (same rules as --max-samples).",
+    )
+    p.add_argument(
+        "--eval-seed",
+        type=int,
+        default=None,
+        help="If set, shuffle eval rows with this seed before capping. "
+        "Useful for variance estimation across multiple eval runs.",
     )
     p.add_argument("--eval-steps", type=int, default=50, help="Run eval every N training steps (when eval enabled).")
 
@@ -123,7 +133,7 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip writing model/tokenizer checkpoints (for grid benchmark runs; saves disk).",
     )
-    p.add_argument("--output-dir", type=str, required=True)
+    p.add_argument("--output-dir", type=str, default=None, help="Output directory (required for training; optional for --eval-only).")
     return p.parse_args()
 
 
@@ -131,7 +141,7 @@ def _apply_preset(args: argparse.Namespace) -> None:
     if args.preset is None:
         return
     if args.preset == "wikitext":
-        args.dataset = "wikitext"
+        args.dataset = "Salesforce/wikitext"
         args.dataset_config = "wikitext-103-raw-v1"
         if args.split == "train":
             args.split = "train"
@@ -179,15 +189,31 @@ def _prepare_packed_dataset(
     tokenizer: Any,
     max_samples: Optional[int],
     desc_prefix: str,
+    seed: Optional[int] = None,
 ) -> Any:
+    try:
+        from datasets.download import DownloadConfig  # type: ignore
+    except ImportError:
+        DownloadConfig = None
+
     kwargs_load: Dict[str, Any] = {"split": split}
     if dataset_config is not None:
         kwargs_load["name"] = dataset_config
+
+    # Set a generous timeout / reduce retries so network failures don't hang forever.
+    # When HF_ENDPOINT is set to a mirror that is unreachable, the default retry loop
+    # can take many minutes.  We also set max_retries=1 to fail faster and let the
+    # user see a clear error.
+    if DownloadConfig is not None:
+        kwargs_load["download_config"] = DownloadConfig(max_retries=1)
     raw = load_dataset(dataset, **kwargs_load)
 
     if max_samples is not None and "[" not in split:
         n = min(len(raw), max_samples)
-        raw = raw.select(range(n))
+        if seed is not None:
+            raw = raw.shuffle(seed=seed).select(range(n))
+        else:
+            raw = raw.select(range(n))
 
     cols = raw.column_names
     if text_column not in cols:
@@ -259,11 +285,26 @@ def _write_run_summary(output_dir: str, summary: Dict[str, Any]) -> None:
 
 
 def main() -> None:
+    import time as time_module
+
     args = _parse_args()
     _apply_preset(args)
+    eval_only = bool(args.eval_only)
     if not args.dataset:
         print("Either --preset or --dataset is required.", file=sys.stderr)
         sys.exit(2)
+
+    if not eval_only and args.output_dir is None:
+        print("--output-dir is required for training (use --eval-only for eval-only mode).", file=sys.stderr)
+        sys.exit(2)
+    if eval_only:
+        # In eval-only mode, force eval on and set a default output_dir for Trainer internals.
+        args.no_eval = False
+        if args.output_dir is None:
+            args.output_dir = "."
+        if not args.eval_split:
+            print("Eval-only mode requires --eval-split (or use --preset wikitext which defaults to validation).", file=sys.stderr)
+            sys.exit(2)
 
     use_eval = not args.no_eval
     if use_eval and not args.eval_split:
@@ -295,20 +336,53 @@ def main() -> None:
     torch_dtype = _resolve_torch_dtype(device_type, args.torch_dtype)
     block_size = int(args.block_size)
 
-    model_path = resolve_hf_model_path(args.model_id)
-    model_path, local_files_only = _prefer_offline_hub_load(args.model_id, model_path)
-    pretrained_kw = dict(trust_remote_code=False, local_files_only=local_files_only)
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, **pretrained_kw)
-    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # ------------------------------------------------------------------
+    # Resolve HF_ENDPOINT for dataset download.  The model should load from
+    # local cache whenever possible (offline), but the datasets library
+    # may need to download data from the Hub.  If the user has not set
+    # HF_ENDPOINT and the default huggingface.co is unreachable, try
+    # hf-mirror.com as a fallback.
+    # ------------------------------------------------------------------
+    _hf_endpoint = os.environ.get("HF_ENDPOINT", "").strip()
+    _use_dataset_mirror = False
+    if not _hf_endpoint:
+        # Model loading first (before setting HF_ENDPOINT) so that
+        # _prefer_offline_hub_load uses local cache.
+        model_path = resolve_hf_model_path(args.model_id)
+        model_path, local_files_only = _prefer_offline_hub_load(args.model_id, model_path)
+        pretrained_kw = dict(trust_remote_code=False, local_files_only=local_files_only)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, **pretrained_kw)
+        if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+            tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"Loading {model_path} …" + (" (local cache only)" if local_files_only else ""))
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
-        **pretrained_kw,
-    )
+        print(f"Loading {model_path} …" + (" (local cache only)" if local_files_only else ""))
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+            **pretrained_kw,
+        )
+        # Dataset is already cached locally; don't set HF_ENDPOINT to avoid
+        # DNS/timeout delays when the mirror is unreachable.  The datasets
+        # library will fall back to local cache automatically.
+        # os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+        # _use_dataset_mirror = True
+        pass
+    else:
+        model_path = resolve_hf_model_path(args.model_id)
+        model_path, local_files_only = _prefer_offline_hub_load(args.model_id, model_path)
+        pretrained_kw = dict(trust_remote_code=False, local_files_only=local_files_only)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, **pretrained_kw)
+        if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        print(f"Loading {model_path} …" + (" (local cache only)" if local_files_only else ""))
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+            **pretrained_kw,
+        )
 
     if args.max_context_len:
         TransformersChatBackend._limit_context_inplace(
@@ -317,11 +391,11 @@ def main() -> None:
     if args.max_layers is not None:
         TransformersChatBackend._truncate_layers_inplace(model, max_layers=int(args.max_layers))
 
-    if args.gradient_checkpointing:
+    if args.gradient_checkpointing and not eval_only:
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
 
-    use_lora = not args.full_finetune
+    use_lora = not args.full_finetune and not eval_only
     lora_targets: Optional[List[str]] = None
     if use_lora:
         lora_targets = (
@@ -330,26 +404,29 @@ def main() -> None:
             else _default_lora_targets()
         )
         model = _apply_lora(model, args)
-    else:
+    elif not eval_only:
         print("Full finetune: all parameters trainable.", flush=True)
 
     trainable, total = _trainable_param_count(model)
-    print(f"Trainable params: {trainable:,} / {total:,} ({100.0 * trainable / max(total, 1):.2f}%)", flush=True)
+    if not eval_only:
+        print(f"Trainable params: {trainable:,} / {total:,} ({100.0 * trainable / max(total, 1):.2f}%)", flush=True)
 
-    train_grouped = _prepare_packed_dataset(
-        load_dataset=load_dataset,
-        dataset=args.dataset,
-        dataset_config=args.dataset_config,
-        split=args.split,
-        text_column=args.text_column,
-        block_size=block_size,
-        tokenizer=tokenizer,
-        max_samples=args.max_samples,
-        desc_prefix="train",
-    )
-    if len(train_grouped) == 0:
-        print("No training rows after tokenize/pack. Check --text-column / data.", file=sys.stderr)
-        sys.exit(1)
+    train_grouped = None
+    if not eval_only:
+        train_grouped = _prepare_packed_dataset(
+            load_dataset=load_dataset,
+            dataset=args.dataset,
+            dataset_config=args.dataset_config,
+            split=args.split,
+            text_column=args.text_column,
+            block_size=block_size,
+            tokenizer=tokenizer,
+            max_samples=args.max_samples,
+            desc_prefix="train",
+        )
+        if len(train_grouped) == 0:
+            print("No training rows after tokenize/pack. Check --text-column / data.", file=sys.stderr)
+            sys.exit(1)
 
     eval_grouped = None
     if use_eval:
@@ -364,6 +441,7 @@ def main() -> None:
             tokenizer=tokenizer,
             max_samples=args.eval_max_samples,
             desc_prefix="eval",
+            seed=args.eval_seed,
         )
         if len(eval_grouped) == 0:
             print(f"No eval rows for split {args.eval_split!r}. Disable with --no-eval.", file=sys.stderr)
@@ -373,28 +451,57 @@ def main() -> None:
 
     use_cuda = device_type == "cuda"
     eval_steps = int(args.eval_steps)
-    training_args = TrainingArguments(
-        output_dir=args.output_dir,
-        max_steps=int(args.max_steps),
-        per_device_train_batch_size=int(args.per_device_train_batch_size),
-        per_device_eval_batch_size=int(args.per_device_eval_batch_size),
-        gradient_accumulation_steps=int(args.gradient_accumulation_steps),
-        learning_rate=float(args.learning_rate),
-        warmup_steps=int(args.warmup_steps),
-        logging_steps=int(args.logging_steps),
-        save_steps=int(args.save_steps),
-        save_total_limit=2,
-        save_strategy="no" if args.benchmark_no_save else "steps",
-        prediction_loss_only=True,
-        report_to="none",
-        seed=args.seed,
-        bf16=use_cuda and torch.cuda.is_bf16_supported(),
-        fp16=use_cuda and not torch.cuda.is_bf16_supported(),
-        use_cpu=(device_type == "cpu"),
-        use_mps_device=(device_type == "mps"),
-        eval_strategy="steps" if use_eval else "no",
-        eval_steps=eval_steps if use_eval else None,
-    )
+
+    # Build device-specific kwargs, with compatibility for transformers >= 5.x
+    # which removed use_mps_device.
+    _device_kw: Dict[str, Any] = {}
+    if device_type == "cpu":
+        _device_kw["use_cpu"] = True
+    elif device_type == "mps":
+        # transformers >= 5.x dropped use_mps_device; try both names.
+        try:
+            TrainingArguments(output_dir="/tmp/_probe", use_mps_device=True, do_train=False, do_eval=False)
+            _device_kw["use_mps_device"] = True
+        except TypeError:
+            pass  # transformers 5.x does not accept use_mps_device
+
+    if eval_only:
+        # Minimal TrainingArguments: no optimizer/scheduler, eval only.
+        training_args = TrainingArguments(
+            output_dir=args.output_dir,
+            per_device_eval_batch_size=int(args.per_device_eval_batch_size),
+            prediction_loss_only=True,
+            report_to="none",
+            seed=args.seed,
+            bf16=use_cuda and torch.cuda.is_bf16_supported(),
+            fp16=use_cuda and not torch.cuda.is_bf16_supported(),
+            do_train=False,
+            do_eval=True,
+            eval_strategy="no",  # manual evaluate() call
+            **_device_kw,
+        )
+    else:
+        training_args = TrainingArguments(
+            output_dir=args.output_dir,
+            max_steps=int(args.max_steps),
+            per_device_train_batch_size=int(args.per_device_train_batch_size),
+            per_device_eval_batch_size=int(args.per_device_eval_batch_size),
+            gradient_accumulation_steps=int(args.gradient_accumulation_steps),
+            learning_rate=float(args.learning_rate),
+            warmup_steps=int(args.warmup_steps),
+            logging_steps=int(args.logging_steps),
+            save_steps=int(args.save_steps),
+            save_total_limit=2,
+            save_strategy="no" if args.benchmark_no_save else "steps",
+            prediction_loss_only=True,
+            report_to="none",
+            seed=args.seed,
+            bf16=use_cuda and torch.cuda.is_bf16_supported(),
+            fp16=use_cuda and not torch.cuda.is_bf16_supported(),
+            eval_strategy="steps" if use_eval else "no",
+            eval_steps=eval_steps if use_eval else None,
+            **_device_kw,
+        )
 
     trainer = Trainer(
         model=model,
@@ -404,17 +511,79 @@ def main() -> None:
         data_collator=collator,
     )
 
-    print(
-        f"Train packed blocks: {len(train_grouped)} | split={args.split!r} | "
-        f"device={device_type} | max_steps={args.max_steps} | "
-        f"peft={'lora' if use_lora else 'none'}"
-    )
+    if not eval_only:
+        print(
+            f"Train packed blocks: {len(train_grouped)} | split={args.split!r} | "
+            f"device={device_type} | max_steps={args.max_steps} | "
+            f"peft={'lora' if use_lora else 'none'}"
+        )
     if use_eval:
         print(
             f"Eval packed blocks: {len(eval_grouped)} | split={args.eval_split!r} | "
-            f"eval_steps={eval_steps}"
+            f"eval_steps={eval_steps if not eval_only else 'N/A (eval-only)'}"
         )
 
+    # ------------------------------------------------------------------
+    # Eval-only path: run eval once, print timing, exit.
+    # ------------------------------------------------------------------
+    if eval_only:
+        assert eval_grouped is not None
+        n_blocks = len(eval_grouped)
+        total_tokens = n_blocks * block_size
+        n_layers = (
+            len(model.model.layers)
+            if hasattr(model.model, "layers")
+            else "?"
+        )
+        print(
+            f"\nEval-only mode: {n_blocks} blocks ({total_tokens:,} tokens) | "
+            f"batch={args.per_device_eval_batch_size} | device={device_type} | layers={n_layers}"
+        )
+        print("Running eval (this may take a while on CPU) …")
+        t0 = time_module.perf_counter()
+        eval_metrics = trainer.evaluate()
+        elapsed = time_module.perf_counter() - t0
+        eval_loss = float(eval_metrics["eval_loss"])
+        ppl = float(torch.exp(torch.tensor(eval_loss)).item())
+        samples_per_sec = n_blocks / elapsed if elapsed > 0 else 0
+        tokens_per_sec = samples_per_sec * block_size
+        print(f"\n{'='*60}")
+        print(f"  Eval loss          : {eval_loss:.6f}")
+        print(f"  Perplexity         : {ppl:.2f}")
+        print(f"  Wall-clock         : {elapsed:.1f}s ({elapsed / 60:.1f} min)")
+        print(f"  Samples/second     : {samples_per_sec:.3f}")
+        print(f"  Tokens/second      : {tokens_per_sec:.1f}")
+        print(f"{'='*60}")
+
+        if args.output_json:
+            import json as json_module
+            result = {
+                "model_id": args.model_id,
+                "max_layers": args.max_layers,
+                "dataset": args.dataset,
+                "dataset_config": args.dataset_config,
+                "eval_split": args.eval_split,
+                "eval_max_samples": args.eval_max_samples,
+                "block_size": block_size,
+                "per_device_eval_batch_size": int(args.per_device_eval_batch_size),
+                "device_type": device_type,
+                "eval_blocks": n_blocks,
+                "eval_tokens": total_tokens,
+                "eval_loss": round(eval_loss, 6),
+                "perplexity": round(ppl, 2),
+                "wall_clock_sec": round(elapsed, 1),
+                "samples_per_second": round(samples_per_sec, 3),
+                "tokens_per_second": round(tokens_per_sec, 1),
+            }
+            json_path = Path(args.output_json)
+            json_path.parent.mkdir(parents=True, exist_ok=True)
+            json_path.write_text(json_module.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+            print(f"Results saved to: {json_path}")
+        return
+
+    # ------------------------------------------------------------------
+    # Training path (original logic below)
+    # ------------------------------------------------------------------
     initial_eval_loss: Optional[float] = None
     if use_eval:
         print("Running initial eval (step 0) …")
