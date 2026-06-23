@@ -35,6 +35,7 @@ from nanochat.common import download_file_with_lock
 LETTERS = "abcdefghijklmnopqrstuvwxyz"
 # A list of 370K English words of large variety
 WORD_LIST_URL = "https://raw.githubusercontent.com/dwyl/english-words/refs/heads/master/words_alpha.txt"
+
 # A number bigger than 370K to separate train and test random seeds
 TEST_RANDOM_SEED_OFFSET = 10_000_000
 

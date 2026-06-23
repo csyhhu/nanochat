@@ -48,8 +48,36 @@ class MMLU(Task):
         return conversation
 
     def evaluate(self, conversation, assistant_response):
-        # the assert here is not strictly speaking needed, but currently the way we eval, we expect this to be true
-        # I'm going to leave the assert here to prevent footguns, but possibly in the future can remove it.
-        assert assistant_response in self.letters, f"MMLU answer {assistant_response} is expected to be one of {self.letters}"
+        # Extract the predicted answer letter from the response.
+        # The model may output a full paragraph like "The correct answer is A, 6.0 eV."
+        # We need to find the first occurrence of A/B/C/D that appears as a standalone letter.
+        pred = self._extract_answer_letter(assistant_response)
+        if pred is None:
+            # If no letter can be extracted, treat as wrong answer
+            return False
         assistant_message = conversation['messages'][-1]['content'] # e.g. "A"
-        return assistant_response == assistant_message
+        return pred == assistant_message
+
+    def _extract_answer_letter(self, text):
+        """Extract the answer letter (A/B/C/D) from a potentially long response."""
+        import re
+        # Try common answer patterns first
+        patterns = [
+            r'answer\s+is\s+([A-D])',      # "answer is A"
+            r'correct\s+is\s+([A-D])',     # "correct is A"
+            r'choose\s+([A-D])',           # "choose A"
+            r'option\s+([A-D])',           # "option A"
+            r'choice\s+([A-D])',           # "choice A"
+            r'([A-D])[\)\.]',              # "A)" or "A."
+            r'\b([A-D])\b',                # standalone A, B, C, D
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(1).upper()
+        return None
+
+    def reward(self, conversation, assistant_response):
+        """Use simple 0-1 reward, same as GSM8K and SpellingBee."""
+        is_correct = self.evaluate(conversation, assistant_response)
+        return float(is_correct)

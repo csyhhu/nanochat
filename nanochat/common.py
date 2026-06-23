@@ -78,18 +78,38 @@ def get_base_dir():
     os.makedirs(nanochat_dir, exist_ok=True)
     return nanochat_dir
 
-def download_file_with_lock(url, filename, postprocess_fn=None):
+def download_file_with_lock(url, filename, postprocess_fn=None, max_retries=3, timeout=30):
     """
     Downloads a file from a URL to a local path in the base directory.
     Uses a lock file to prevent concurrent downloads among multiple ranks.
+    
+    Args:
+        url: URL to download
+        filename: Local filename
+        postprocess_fn: Optional function to process the file after download
+        max_retries: Maximum number of retries (default: 3)
+        timeout: Timeout in seconds (default: 30)
+    
+    Returns:
+        Local file path
     """
     base_dir = get_base_dir()
     file_path = os.path.join(base_dir, filename)
     lock_path = file_path + ".lock"
 
     if os.path.exists(file_path):
+        print(f"  [Download] File already exists: {file_path}")
         return file_path
 
+    # Use domestic mirror if HF_ENDPOINT is set to hf-mirror.com
+    actual_url = url
+    if os.environ.get("HF_ENDPOINT") and "hf-mirror" in os.environ.get("HF_ENDPOINT", ""):
+        if "raw.githubusercontent.com" in url:
+            # Use ghproxy.com as mirror (only if not already proxied)
+            if "ghproxy.com" not in url:
+                actual_url = f"https://ghproxy.com/{url}"
+                print(f"  [Download] Using domestic mirror...")
+    
     with FileLock(lock_path):
         # Only a single rank can acquire this lock
         # All other ranks block until it is released
@@ -98,26 +118,69 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
         if os.path.exists(file_path):
             return file_path
 
-        # Download the content as bytes
-        print(f"Downloading {url}...")
-        with urllib.request.urlopen(url) as response:
-            content = response.read() # bytes
-
-        # Write to local file
-        with open(file_path, 'wb') as f:
-            f.write(content)
-        print(f"Downloaded to {file_path}")
-
-        # Run the postprocess function if provided
-        if postprocess_fn is not None:
-            postprocess_fn(file_path)
+        # Download the content as bytes (with retry)
+        print(f"Downloading {actual_url}...")
+        
+        for attempt in range(max_retries):
+            try:
+                # Set timeout
+                import socket
+                socket.setdefaulttimeout(timeout)
+                
+                with urllib.request.urlopen(actual_url) as response:
+                    content = response.read() # bytes
+                
+                # Write to local file
+                with open(file_path, 'wb') as f:
+                    f.write(content)
+                print(f"  [Download] [OK] Downloaded to {file_path}")
+                
+                # Run the postprocess function if provided
+                if postprocess_fn is not None:
+                    postprocess_fn(file_path)
+                
+                return file_path
+            
+            except Exception as e:
+                print(f"  [Download] [WARN] Attempt {attempt + 1}/{max_retries} failed: {e}")
+                
+                if attempt < max_retries - 1:
+                    # Wait before retrying (exponential backoff)
+                    import time
+                    wait_time = 2 ** attempt  # 1s, 2s, 4s, ...
+                    print(f"  [Download] Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    # All retries failed
+                    print(f"  [Download] [FAIL] All {max_retries} attempts failed!")
+                    print(f"  [Download] Please check your network connection or download manually:")
+                    print(f"  [Download]   URL: {url}")
+                    print(f"  [Download]   Save to: {file_path}")
+                    raise e
 
     return file_path
+
+def safe_print(msg, **kwargs):
+    """
+    Safely print message, handling Windows console encoding issues.
+    Removes emoji/unicode characters that can't be displayed in GBK encoding.
+    """
+    try:
+        print(msg, **kwargs)
+    except UnicodeEncodeError:
+        # Remove emoji and non-ASCII characters for Windows console
+        import re
+        # Remove emoji characters (common patterns)
+        safe_msg = re.sub(r'[\U0001F300-\U0001F9FF]', '', msg)  # Emoji range
+        safe_msg = re.sub(r'[\u2600-\u26FF]', '', safe_msg)      # Misc symbols
+        safe_msg = re.sub(r'[\u2700-\u27BF]', '', safe_msg)      # Dingbats
+        safe_msg = safe_msg.encode('ascii', errors='ignore').decode('ascii')
+        print(safe_msg, **kwargs)
 
 def print0(s="",**kwargs):
     ddp_rank = int(os.environ.get('RANK', 0))
     if ddp_rank == 0:
-        print(s, **kwargs)
+        safe_print(s, **kwargs)
 
 def print_banner():
     # Cool DOS Rebel font ASCII banner made with https://manytools.org/hacker-tools/ascii-banner/

@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# Force offline mode BEFORE any huggingface_hub / transformers import.
+# AutoTokenizer.from_pretrained internally calls model_info() even when
+# local_files_only=True, which triggers a connection to huggingface.co.
+import os
+
+os.environ["HF_HUB_OFFLINE"] = "1"
+if not os.environ.get("HF_ENDPOINT", "").strip():
+    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 """
 Continue pretraining (causal LM loss) on a Hugging Face causal LM, with optional
 first-N-layer truncation — same idea as `scripts/chat_web.py --hf-max-layers`.
@@ -33,7 +42,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -311,6 +319,11 @@ def main() -> None:
         print("Eval enabled but --eval-split is missing (use --no-eval or set --eval-split).", file=sys.stderr)
         sys.exit(2)
 
+    # HF_HUB_OFFLINE is already set at the top of this file (before imports).
+    # Set HF mirror for any remaining Hub requests.
+    if not os.environ.get("HF_ENDPOINT", "").strip():
+        os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
     try:
         from datasets import load_dataset  # type: ignore
         from transformers import (  # type: ignore
@@ -318,6 +331,7 @@ def main() -> None:
             AutoTokenizer,
             DataCollatorForLanguageModeling,
             Trainer,
+            TrainerCallback,
             TrainingArguments,
             set_seed,
         )
@@ -331,58 +345,61 @@ def main() -> None:
         )
         sys.exit(1)
 
+    # ------------------------------------------------------------------
+    # Custom callback: write train/eval loss to JSON-lines at every
+    # logging/eval step so we can monitor the full curve in real time.
+    # ------------------------------------------------------------------
+    class LossHistoryCallback(TrainerCallback):
+        """Appends one JSON per line to ``output_dir/loss_history.jsonl``:
+          - on_log:  {"step": N, "train_loss": X.XX, "grad_norm": X.XX}
+          - on_evaluate: {"step": N, "eval_loss": X.XX}
+        """
+
+        def __init__(self, output_dir: str, filename: str = "loss_history.jsonl"):
+            self._path = Path(output_dir) / filename
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text("", encoding="utf-8")  # truncate
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            # Only record when there's actual training loss (not empty dict, not just epoch info)
+            if not logs or "loss" not in logs:
+                return
+            rec: Dict[str, Any] = {"step": int(state.global_step), "train_loss": float(logs["loss"])}
+            if "grad_norm" in logs:
+                rec["grad_norm"] = float(logs["grad_norm"])
+            with open(self._path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+
+        def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+            if not metrics or "eval_loss" not in metrics:
+                return
+            rec: Dict[str, Any] = {"step": int(state.global_step), "eval_loss": float(metrics["eval_loss"])}
+            with open(self._path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+
     set_seed(args.seed)
     device_type = args.device_type
     torch_dtype = _resolve_torch_dtype(device_type, args.torch_dtype)
     block_size = int(args.block_size)
 
     # ------------------------------------------------------------------
-    # Resolve HF_ENDPOINT for dataset download.  The model should load from
-    # local cache whenever possible (offline), but the datasets library
-    # may need to download data from the Hub.  If the user has not set
-    # HF_ENDPOINT and the default huggingface.co is unreachable, try
-    # hf-mirror.com as a fallback.
+    # Load model from local cache (offline) when possible, with HF mirror
+    # already set for any remaining Hub requests (dataset download).
     # ------------------------------------------------------------------
-    _hf_endpoint = os.environ.get("HF_ENDPOINT", "").strip()
-    _use_dataset_mirror = False
-    if not _hf_endpoint:
-        # Model loading first (before setting HF_ENDPOINT) so that
-        # _prefer_offline_hub_load uses local cache.
-        model_path = resolve_hf_model_path(args.model_id)
-        model_path, local_files_only = _prefer_offline_hub_load(args.model_id, model_path)
-        pretrained_kw = dict(trust_remote_code=False, local_files_only=local_files_only)
-        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, **pretrained_kw)
-        if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
-            tokenizer.pad_token = tokenizer.eos_token
+    model_path = resolve_hf_model_path(args.model_id)
+    model_path, local_files_only = _prefer_offline_hub_load(args.model_id, model_path)
+    pretrained_kw = dict(trust_remote_code=False, local_files_only=local_files_only)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, **pretrained_kw)
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-        print(f"Loading {model_path} …" + (" (local cache only)" if local_files_only else ""))
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch_dtype,
-            low_cpu_mem_usage=True,
-            **pretrained_kw,
-        )
-        # Dataset is already cached locally; don't set HF_ENDPOINT to avoid
-        # DNS/timeout delays when the mirror is unreachable.  The datasets
-        # library will fall back to local cache automatically.
-        # os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-        # _use_dataset_mirror = True
-        pass
-    else:
-        model_path = resolve_hf_model_path(args.model_id)
-        model_path, local_files_only = _prefer_offline_hub_load(args.model_id, model_path)
-        pretrained_kw = dict(trust_remote_code=False, local_files_only=local_files_only)
-        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, **pretrained_kw)
-        if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        print(f"Loading {model_path} …" + (" (local cache only)" if local_files_only else ""))
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch_dtype,
-            low_cpu_mem_usage=True,
-            **pretrained_kw,
-        )
+    print(f"Loading {model_path} …" + (" (local cache only)" if local_files_only else ""))
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch_dtype,
+        low_cpu_mem_usage=True,
+        **pretrained_kw,
+    )
 
     if args.max_context_len:
         TransformersChatBackend._limit_context_inplace(
@@ -509,6 +526,7 @@ def main() -> None:
         train_dataset=train_grouped,
         eval_dataset=eval_grouped,
         data_collator=collator,
+        callbacks=[LossHistoryCallback(args.output_dir)] if not eval_only else None,
     )
 
     if not eval_only:
@@ -582,7 +600,7 @@ def main() -> None:
         return
 
     # ------------------------------------------------------------------
-    # Training path (original logic below)
+    # Training path
     # ------------------------------------------------------------------
     initial_eval_loss: Optional[float] = None
     if use_eval:
@@ -598,12 +616,11 @@ def main() -> None:
 
     final_train_loss = train_result.training_loss
     train_metrics: Dict[str, Any] = dict(getattr(train_result, "metrics", None) or {})
+    # The last eval_loss was already captured by LossHistoryCallback during train(),
+    # and is also available in train_result.metrics if eval happened on the last step.
     final_eval_loss: Optional[float] = None
-    if use_eval:
-        print("Running final eval …")
-        final_metrics = trainer.evaluate()
-        final_eval_loss = float(final_metrics["eval_loss"])
-        print(f"Final eval_loss: {final_eval_loss:.6f}")
+    if use_eval and "eval_loss" in train_metrics:
+        final_eval_loss = float(train_metrics["eval_loss"])
 
     state_path = Path(args.output_dir) / "trainer_state.json"
     summary = {

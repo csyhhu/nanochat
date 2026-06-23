@@ -3,7 +3,44 @@
 > 延续 Mac 上 `tutorial/mac_training_guide.md` 第 7 节 **Hugging Face / transformers 后端** 实验。  
 > Windows **无 MPS**，`--device-type cpu` 是默认稳妥路径，且**不会**遇到 Mac 上 Metal 临时张量 >4GB 的限制。
 
----
+- [Windows：Qwen2.5-0.5B（6 层）加载与 Serving](#windowsqwen25-05b6-层加载与-serving)
+  - [1. 能否在 Windows 上跑？](#1-能否在-windows-上跑)
+  - [2. 环境策略：单独 conda env（推荐）](#2-环境策略单独-conda-env推荐)
+    - [2.1 创建环境（PowerShell）](#21-创建环境powershell)
+    - [2.2 安装依赖（推荐：国内 PyPI 镜像）](#22-安装依赖推荐国内-pypi-镜像)
+    - [2.3 Hugging Face 模型下载镜像（国内必设）](#23-hugging-face-模型下载镜像国内必设)
+      - [方式 A：环境变量（推荐，与 `chat_web` / 冒烟脚本通用）](#方式-a环境变量推荐与-chat_web--冒烟脚本通用)
+      - [默认缓存位置（未指定 `--local-dir` 时）](#默认缓存位置未指定---local-dir-时)
+      - [方式 B：先离线下好到固定目录，再指向本地](#方式-b先离线下好到固定目录再指向本地)
+      - [方式 C：ModelScope（HF 仍失败时）](#方式-cmodelscopehf-仍失败时)
+      - [常见报错](#常见报错)
+    - [2.4 可选：缓存目录](#24-可选缓存目录)
+  - [3. 激活与项目路径](#3-激活与项目路径)
+  - [4. 冒烟：6 层加载（不启动 Web）](#4-冒烟6-层加载不启动-web)
+  - [5. Web Serving（与 Mac 相同参数）](#5-web-serving与-mac-相同参数)
+      - [浏览器访问地址（Windows 实践记录）](#浏览器访问地址windows-实践记录)
+  - [8. WikiText continue Pre-Training（含周期性 eval）](#8-wikitext-continue-pre-training含周期性-eval)
+    - [8.0 机器运行时间测试：**Small's Win**（吞吐与 LoRA / 全量对比）](#80-机器运行时间测试smalls-win吞吐与-lora--全量对比)
+      - [全量微调 vs LoRA（实测）](#全量微调-vs-lora实测)
+      - [全量扫参最佳（`run_0020`）](#全量扫参最佳run_0020)
+      - [时间外推（仅 train，无 eval）](#时间外推仅-train无-eval)
+    - [8.1 观测 CPU / 内存 占用](#81-观测-cpu--内存-占用)
+      - [Windows 本机（PowerShell 里跑训练时）](#windows-本机powershell-里跑训练时)
+      - [htop](#htop)
+      - [怎么判断「是否吃满机器」（CPU 训练）](#怎么判断是否吃满机器cpu-训练)
+    - [8.2 最佳训练参数（速度最快）：扫参 benchmark 与结果分析](#82-最佳训练参数速度最快扫参-benchmark-与结果分析)
+      - [比速度看哪个指标？](#比速度看哪个指标)
+      - [小网格（约 6 组）](#小网格约-6-组)
+      - [大网格（72 组，耗时长）](#大网格72-组耗时长)
+      - [分析已有 run（无需重新训练）](#分析已有-run无需重新训练)
+    - [8.4 快速Eval: `--eval-max-samples` 选择](#84-快速eval---eval-max-samples-选择)
+      - [运行 sweep（自动批量）](#运行-sweep自动批量)
+      - [汇总结果](#汇总结果)
+      - [结果](#结果)
+      - [解读与建议](#解读与建议)
+    - [8.5 全量微调 + 定期 Eval（`--full-finetune`）](#85-全量微调--定期-eval--full-finetune)
+  - [7. 常见问题](#7-常见问题)
+
 
 ## 1. 能否在 Windows 上跑？
 
@@ -272,50 +309,7 @@ curl.exe -X POST http://127.0.0.1:8003/chat/completions_sync `
 
 ---
 
-## 6. Windows 与 Mac 差异
-
-| 项目 | Mac | Windows |
-|------|-----|---------|
-| 推荐设备 | `--device-type cpu`（MPS 易触发 4GB 限制） | `--device-type cpu`（无 MPS） |
-| 环境变量 | `export PYTHONPATH=...` | `$env:PYTHONPATH = ...` |
-| 多 GPU worker | 不适用 | 不适用（`num-gpus` 仅 CUDA） |
-| 浏览器 URL | `http://localhost:...` 通常可用 | **建议 `http://127.0.0.1:<port>`**（避免 localhost→IPv6 问题） |
-| `execution.py` 沙箱 | Darwin 有额外逻辑 | 非 Darwin 路径不同，与 transformers 推理无关 |
-
----
-
-## 7. 常见问题
-
-**浏览器「无法访问网站」**  
-1. 是否已打印 **`Server ready at http://localhost:...`**（模型未加载完时访问会失败）。  
-2. 是否使用 **`http://127.0.0.1:<端口>`** 而非 `localhost`（见第 5 节）。  
-3. `netstat -ano | findstr :<端口>` 是否有 `LISTENING`。  
-4. 是否在 `D:\WorkSpace\nanochat` 下启动（否则 UI 静态页可能 500）。
-
-**`conda` 找不到**  
-将 `C:\Users\<你>\miniconda3\Scripts` 加入系统 PATH，或始终用 `$env:USERPROFILE\miniconda3\Scripts\conda.exe` 全路径。
-
-**下载慢 / 超时**  
-设置 `HF_ENDPOINT` 镜像，或提前用 `huggingface-cli download Qwen/Qwen2.5-0.5B`。
-
-**内存不足**  
-保持 `--hf-max-context-len 1024`，关闭其它占内存程序；6 层 0.5B 在 CPU 上通常需约 2–4GB 量级 RAM（视是否缓存全量下载而定）。
-
-**主 nanochat 环境与 qwen env 混用**  
-训练自研 GPT 用主 env；Qwen 实验只用 `nanochat-qwen`，避免 `kernels` 与 `transformers` 抢 `huggingface-hub` 版本。
-
-**continue PT：`Trainer` 要求 `accelerate>=0.26.0`；默认 LoRA 要求 `peft`**  
-`pip install "accelerate>=0.26.0" "peft>=0.13.0"` 或按 §2.2 安装；见 §8。
-
-**LoRA 与全量微调**  
-默认只保存 **adapter**；`chat_web` 需能加载 adapter 或先合并权重。全量 checkpoint 用 `--full-finetune`。
-
-**扫参占满磁盘**  
-旧版 benchmark 会写 `model.safetensors`；请用当前脚本（自带 `--benchmark-no-save`），或只保留 `benchmark_stdout.log` / `pt_run_summary.json` 后删掉 `run_*/checkpoint-*` 与权重。用 §8.2 的 `analyze_pt_benchmark` 离线分析。
-
----
-
-## 8. WikiText continue PT（含周期性 eval）
+## 8. WikiText continue Pre-Training（含周期性 eval）
 
 `scripts/qwen_continue_pt.py` 支持 **train / eval 分 split**（`--preset wikitext` 时默认 `train` + **`validation`**）。
 
@@ -331,7 +325,7 @@ curl.exe -X POST http://127.0.0.1:8003/chat/completions_sync `
 
 推理加载 LoRA 需 Base + adapter（`chat_web` 若未接 PEFT，可先用 `peft` 合并权重或后续再接 adapter 路径）。
 
-### 8.0 机器记录：**LuoYu's Win**（吞吐与 LoRA / 全量对比）
+### 8.0 机器运行时间测试：**Small's Win**（吞吐与 LoRA / 全量对比）
 
 结构化备份：[`benchmarks/pt-grid-full/LuoYu_Win_pt_benchmark.json`](../benchmarks/pt-grid-full/LuoYu_Win_pt_benchmark.json)。
 
@@ -496,7 +490,7 @@ JSON 输出示例：
 }
 ```
 
-### 8.1 观测 CPU / 内存（外部工具，不改训练代码）
+### 8.1 观测 CPU / 内存 占用
 
 在**另一个终端或图形界面**观察；`qwen_continue_pt` 不内置资源日志。
 
@@ -519,7 +513,7 @@ while ($true) {
 }
 ```
 
-#### 想用 htop 时
+#### htop
 
 **htop 面向 Linux / macOS 终端，Windows 无官方原生版。**
 
@@ -542,7 +536,7 @@ while ($true) {
 
 **判断 batch 是否还能加大：** 在内存不 OOM 的前提下，对比日志里的 `train_samples_per_second`（越大越好），不要只看总 CPU % 或 `train_steps_per_second`。
 
-### 8.2 扫参 benchmark 与结果分析
+### 8.2 最佳训练参数（速度最快）：扫参 benchmark 与结果分析
 
 两套脚本分工：
 
@@ -615,7 +609,7 @@ python -m scripts.analyze_pt_benchmark --benchmark-dir benchmarks/pt-grid-full
 自定义网格：`--grid-json path/to/grid.json`，例如  
 `{"per_device_train_batch_size":[1,2,4],"gradient_accumulation_steps":[4,8],"block_size":[256,512],"omp_num_threads":[null,8],"gradient_checkpointing":[false]}`。
 
-### 8.4 `--eval-max-samples` 选择：方差分析
+### 8.4 快速Eval: `--eval-max-samples` 选择
 
 **问题：** `--eval-max-samples` 设多少才够？设太小 loss 波动大不可信，设太大浪费时间。
 
@@ -689,9 +683,9 @@ python -m scripts.qwen_continue_pt `
   --max-layers 6 `
   --preset wikitext `
   --eval-max-samples 100 `
-  --eval-steps 50 `
+  --eval-steps 2 `
   --block-size 256 `
-  --max-steps 500 `
+  --max-steps 10 `
   --learning-rate 2e-5 `
   --warmup-steps 50 `
   --per-device-train-batch-size 4 `
@@ -699,8 +693,10 @@ python -m scripts.qwen_continue_pt `
   --gradient-accumulation-steps 8 `
   --device-type cpu `
   --full-finetune `
-  --output-dir D:/WorkSpace/nanochat/checkpoints/qwen6-ft-wiki `
-  > qwen6-ft-wiki.log 2>&1
+  --output-dir D:/WorkSpace/nanochat/checkpoints/qwen6-ft-wiki-quick `
+  --benchmark-no-save `
+  --logging-steps 1 `
+  > logs/qwen6-ft-wiki-quick.log 2>&1
 ```
 
 **参数说明：**
@@ -721,8 +717,42 @@ python -m scripts.qwen_continue_pt `
 
 **想改回 LoRA：** 去掉 `--full-finetune` 并改 `--output-dir` 即可。
 
----
 
-## 9. 下一步（线索 B）
+## 7. 常见问题
 
-1. 本页 4–5 节验收通过 → 2. `qwen_continue_pt`（6 层 + WikiText + eval）→ 3. 24L Base 同 eval 集 loss（待 `qwen_eval_lm_loss`）→ 4. SFT → 5. serving 加速。
+**浏览器「无法访问网站」**  
+1. 是否已打印 **`Server ready at http://localhost:...`**（模型未加载完时访问会失败）。  
+2. 是否使用 **`http://127.0.0.1:<端口>`** 而非 `localhost`（见第 5 节）。  
+3. `netstat -ano | findstr :<端口>` 是否有 `LISTENING`。  
+4. 是否在 `D:\WorkSpace\nanochat` 下启动（否则 UI 静态页可能 500）。
+
+**`conda` 找不到**  
+将 `C:\Users\<你>\miniconda3\Scripts` 加入系统 PATH，或始终用 `$env:USERPROFILE\miniconda3\Scripts\conda.exe` 全路径。
+
+**下载慢 / 超时**  
+设置 `HF_ENDPOINT` 镜像，或提前用 `huggingface-cli download Qwen/Qwen2.5-0.5B`。
+
+**内存不足**  
+保持 `--hf-max-context-len 1024`，关闭其它占内存程序；6 层 0.5B 在 CPU 上通常需约 2–4GB 量级 RAM（视是否缓存全量下载而定）。
+
+**主 nanochat 环境与 qwen env 混用**  
+训练自研 GPT 用主 env；Qwen 实验只用 `nanochat-qwen`，避免 `kernels` 与 `transformers` 抢 `huggingface-hub` 版本。
+
+**continue PT：`Trainer` 要求 `accelerate>=0.26.0`；默认 LoRA 要求 `peft`**  
+`pip install "accelerate>=0.26.0" "peft>=0.13.0"` 或按 §2.2 安装；见 §8。
+
+**LoRA 与全量微调**  
+默认只保存 **adapter**；`chat_web` 需能加载 adapter 或先合并权重。全量 checkpoint 用 `--full-finetune`。
+
+**扫参占满磁盘**  
+旧版 benchmark 会写 `model.safetensors`；请用当前脚本（自带 `--benchmark-no-save`），或只保留 `benchmark_stdout.log` / `pt_run_summary.json` 后删掉 `run_*/checkpoint-*` 与权重。用 §8.2 的 `analyze_pt_benchmark` 离线分析。
+
+**Windows 与 Mac 差异**
+
+| 项目 | Mac | Windows |
+|------|-----|---------|
+| 推荐设备 | `--device-type cpu`（MPS 易触发 4GB 限制） | `--device-type cpu`（无 MPS） |
+| 环境变量 | `export PYTHONPATH=...` | `$env:PYTHONPATH = ...` |
+| 多 GPU worker | 不适用 | 不适用（`num-gpus` 仅 CUDA） |
+| 浏览器 URL | `http://localhost:...` 通常可用 | **建议 `http://127.0.0.1:<port>`**（避免 localhost→IPv6 问题） |
+| `execution.py` 沙箱 | Darwin 有额外逻辑 | 非 Darwin 路径不同，与 transformers 推理无关 |

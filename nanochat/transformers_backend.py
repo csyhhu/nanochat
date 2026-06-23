@@ -71,14 +71,35 @@ def _prefer_offline_hub_load(model_id: str, load_path: str) -> tuple[str, bool]:
     """
     If weights are cached locally, load from snapshot with local_files_only=True
     so huggingface.co is not contacted (avoids timeouts without HF_ENDPOINT).
+
+    Priority:
+    1. HF_HUB_OFFLINE=1 → always use local cache (skip network entirely)
+    2. NANOCHAT_HF_LOCAL_FILES_ONLY=1 → force local_files_only
+    3. HF_ENDPOINT is set → allow network (user has working mirror)
+    4. Otherwise → try local cache, warn if not found
     """
     raw = model_id.strip()
     if not _is_hf_hub_repo_id(raw):
         return load_path, False
 
+    # If HF_HUB_OFFLINE is set, skip all network attempts
+    offline = os.environ.get("HF_HUB_OFFLINE", "").strip()
+    if offline in ("1", "true", "yes"):
+        cached = resolve_hub_cached_snapshot(raw)
+        if cached:
+            logger.info("Using local Hugging Face cache (HF_HUB_OFFLINE=1): %s", cached)
+            return cached, True
+        logger.warning(
+            "HF_HUB_OFFLINE=1 but model cache not found for %s. "
+            "Ensure the model has been downloaded first.", raw
+        )
+        return load_path, True
+
+    # User has a working mirror configured → allow lightweight network access
     if os.environ.get("HF_ENDPOINT", "").strip():
         return load_path, False
 
+    # No mirror, no offline flag → try local cache
     cached = resolve_hub_cached_snapshot(raw)
     if cached:
         logger.info("Using local Hugging Face cache (offline): %s", cached)

@@ -13,3 +13,7 @@ requests
 datasets>=4.0.0
 accelerate>=0.26.0
 peft>=0.13.0
+
+# Optional: vLLM for fast rollout generation (5-10x speedup on GPU)
+# vLLM requires GPU and CUDA. Install with: pip install vllm
+# vllm>=0.4.0  # Uncomment to enable vLLM support
